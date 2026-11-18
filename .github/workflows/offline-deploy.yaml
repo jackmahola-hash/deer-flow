@@ -3,168 +3,268 @@ name: Offline Deploy Build
 on:
   workflow_dispatch:
 
-env:
-  DEERFLOW_ROOT: /opt/deerflow
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 150
+    timeout-minutes: 90
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Stage source at fixed path
+      - name: Configure runtime files
         run: |
-          sudo mkdir -p "$DEERFLOW_ROOT"
-          sudo chown "$(id -un):$(id -gn)" "$DEERFLOW_ROOT"
-          rsync -a --exclude .git "$GITHUB_WORKSPACE/" "$DEERFLOW_ROOT/deer-flow/"
-
-      - name: Install uv
-        run: curl -LsSf https://astral.sh/uv/install.sh | sh
-
-      - name: Sync backend Python 3.12 environment
-        run: |
-          export UV_PYTHON_INSTALL_DIR="$DEERFLOW_ROOT/python"
-          cd "$DEERFLOW_ROOT/deer-flow/backend"
-          ~/.local/bin/uv sync --locked --all-packages --python 3.12
-          .venv/bin/python --version
-
-      - name: Set up Node 22
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Bundle Node runtime
-        run: |
-          NODE_DIR="$(dirname "$(dirname "$(readlink -f "$(which node)")")")"
-          cp -a "$NODE_DIR" "$DEERFLOW_ROOT/node"
-          "$DEERFLOW_ROOT/node/bin/node" --version
-
-      - name: Build frontend (production)
-        run: |
-          cd "$DEERFLOW_ROOT/deer-flow/frontend"
-          corepack enable
-          pnpm install --frozen-lockfile
-          SKIP_ENV_VALIDATION=1 pnpm build
-          pnpm prune --prod
-
-      - name: Configure for offline host-process deploy
-        run: |
-          cd "$DEERFLOW_ROOT/deer-flow"
           cp config.example.yaml config.yaml
           python3 - <<'EOF'
           p = "config.yaml"
           s = open(p, encoding="utf-8").read()
-          s = s.replace(
-              "sandbox:\n  use: deerflow.sandbox.local:LocalSandboxProvider",
-              "sandbox:\n  use: deerflow.community.aio_sandbox:AioSandboxProvider\n"
-              "  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0",
-          )
-          open(p, "w", encoding="utf-8").write(s)
+          old = "sandbox:\n  use: deerflow.sandbox.local:LocalSandboxProvider"
+          new = ("sandbox:\n  use: deerflow.community.aio_sandbox:AioSandboxProvider\n"
+                 "  image: enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0")
+          assert old in s, "sandbox block not found in config.example.yaml"
+          open(p, "w", encoding="utf-8").write(s.replace(old, new))
+          print("sandbox provider -> AioSandboxProvider + sandbox image pinned")
           EOF
+          grep -n "AioSandboxProvider" config.yaml | head -2
           printf '{\n  "middlewares": [],\n  "mcpInterceptors": [],\n  "mcpServers": {}\n}\n' > extensions_config.json
-
-      - name: Generate host-mode nginx config
-        run: |
-          cd "$DEERFLOW_ROOT/deer-flow"
+          printf 'registry=http://172.16.13.24/repository/npm/\n' > frontend/.npmrc
           sed -e 's|set $gateway_upstream gateway:8001;|set $gateway_upstream 127.0.0.1:8001;|' \
               -e 's|set $frontend_upstream frontend:3000;|set $frontend_upstream 127.0.0.1:3000;|' \
               -e 's|set $provisioner_upstream provisioner:8002;|set $provisioner_upstream 127.0.0.1:8002;|' \
               -e 's|resolver 127.0.0.11|resolver 127.0.0.1|' \
               -e '/listen \[::\]:2026/d' \
               docker/nginx/nginx.conf > docker/nginx/nginx-host.conf
-          grep -n "upstream" docker/nginx/nginx-host.conf | head -5
+          grep -q 'set $gateway_upstream 127.0.0.1:8001;' docker/nginx/nginx-host.conf
+          grep -q 'set $frontend_upstream 127.0.0.1:3000;' docker/nginx/nginx-host.conf
+          echo "nginx host config ready"
 
-      - name: Write start/stop scripts
+      - name: Write compose file and scripts
         run: |
-          cat > "$DEERFLOW_ROOT/deer-flow/start-offline.sh" <<'SCRIPT'
+          mkdir -p scripts-offline
+
+          cat > docker/docker-compose.offline.yaml <<'YAML'
+          services:
+            redis:
+              image: redis:7-alpine
+              container_name: deerflow-redis
+              network_mode: host
+              command: ["redis-server", "--appendonly", "yes", "--bind", "127.0.0.1"]
+              volumes:
+                - /opt/deerflow/redis-data:/data
+              healthcheck:
+                test: ["CMD", "redis-cli", "ping"]
+                interval: 5s
+                timeout: 3s
+                retries: 30
+              restart: unless-stopped
+
+            nginx:
+              image: nginx:1.31.2-alpine
+              container_name: deerflow-nginx
+              network_mode: host
+              volumes:
+                - /opt/deerflow/deer-flow/docker/nginx/nginx-host.conf:/etc/nginx/nginx.conf:ro
+              restart: unless-stopped
+
+            backend:
+              image: python:3.12-bookworm
+              container_name: deerflow-backend
+              network_mode: host
+              init: true
+              stop_grace_period: 90s
+              working_dir: /opt/deerflow/deer-flow/backend
+              volumes:
+                - /opt/deerflow/deer-flow:/opt/deerflow/deer-flow
+                - /var/run/docker.sock:/var/run/docker.sock
+              env_file:
+                - /opt/deerflow/.env
+              environment:
+                - CI=true
+                - PIP_INDEX_URL=http://172.16.13.24/repository/pypi-proxy-aliyun/simple
+                - UV_DEFAULT_INDEX=http://172.16.13.24/repository/pypi-proxy-aliyun/simple
+                - UV_PYTHON_DOWNLOADS=never
+                - DEER_FLOW_PROJECT_ROOT=/opt/deerflow/deer-flow
+                - DEER_FLOW_HOME=/opt/deerflow/deer-flow/backend/.deer-flow
+                - DEER_FLOW_CONFIG_PATH=/opt/deerflow/deer-flow/config.yaml
+                - DEER_FLOW_EXTENSIONS_CONFIG_PATH=/opt/deerflow/deer-flow/extensions_config.json
+                - DEER_FLOW_STREAM_BRIDGE_REDIS_URL=redis://127.0.0.1:6379/0
+                - DEER_FLOW_CHANNELS_LANGGRAPH_URL=http://127.0.0.1:8001/api
+                - DEER_FLOW_CHANNELS_GATEWAY_URL=http://127.0.0.1:8001
+                - DEER_FLOW_HOST_BASE_DIR=/opt/deerflow/deer-flow/backend/.deer-flow
+                - DEER_FLOW_SANDBOX_HOST=172.17.0.1
+                - DEER_FLOW_DOCKER_SOCKET=/var/run/docker.sock
+                - AUTH_TRUSTED_PROXIES=127.0.0.1
+              command: ["bash", "/opt/deerflow/deer-flow/scripts-offline/backend-run.sh"]
+              depends_on:
+                redis:
+                  condition: service_healthy
+              restart: unless-stopped
+
+            frontend:
+              image: node:22-bookworm
+              container_name: deerflow-frontend
+              network_mode: host
+              working_dir: /opt/deerflow/deer-flow/frontend
+              volumes:
+                - /opt/deerflow/deer-flow:/opt/deerflow/deer-flow
+              env_file:
+                - /opt/deerflow/.env
+              environment:
+                - DEER_FLOW_INTERNAL_GATEWAY_BASE_URL=http://127.0.0.1:8001
+                - COREPACK_NPM_REGISTRY=http://172.16.13.24/repository/npm/
+                - COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+                - npm_config_registry=http://172.16.13.24/repository/npm/
+              command: ["bash", "/opt/deerflow/deer-flow/scripts-offline/frontend-run.sh"]
+              restart: unless-stopped
+          YAML
+
+          cat > scripts-offline/backend-run.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DF=/opt/deerflow/deer-flow
+          cd "$DF/backend"
+          if [ ! -x .venv/bin/python ]; then
+            echo "[backend] first boot: installing Python environment from pypi proxy (5-15 min)..."
+            pip install --no-cache-dir --quiet uv
+            uv sync --locked --all-packages
+          fi
+          echo "[backend] starting gateway on 0.0.0.0:8001"
+          exec env PYTHONPATH=. .venv/bin/python -m uvicorn app.gateway.app:app --host 0.0.0.0 --port 8001
+          SH
+
+          cat > scripts-offline/frontend-run.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          DF=/opt/deerflow/deer-flow
+          cd "$DF/frontend"
+          if [ ! -e node_modules/next ]; then
+            echo "[frontend] first boot: installing dependencies + building from npm proxy (10-25 min)..."
+            corepack enable
+            pnpm --version
+            pnpm install --frozen-lockfile
+            SKIP_ENV_VALIDATION=1 pnpm build
+          fi
+          echo "[frontend] starting on 127.0.0.1:3000"
+          exec node node_modules/next/dist/bin/next start -H 127.0.0.1 -p 3000
+          SH
+
+          cat > scripts-offline/start-offline.sh <<'SH'
           #!/usr/bin/env bash
           set -euo pipefail
           ROOT=/opt/deerflow
           DF="$ROOT/deer-flow"
-          LOGS="$DF/logs"
-          mkdir -p "$LOGS" "$DF/backend/.deer-flow" "$DF/backend/sandbox" "$DF/temp"
+
+          gen_hex() {
+            openssl rand -hex 16 2>/dev/null || \
+              docker run --rm python:3.12-bookworm python -c "import secrets; print(secrets.token_hex(16))"
+          }
 
           if [ ! -f "$ROOT/.env" ]; then
             umask 077
             cat > "$ROOT/.env" <<ENVEOF
-          BETTER_AUTH_SECRET=$(openssl rand -hex 16)
-          DEER_FLOW_INTERNAL_AUTH_TOKEN=$(openssl rand -hex 16)
+          BETTER_AUTH_SECRET=$(gen_hex)
+          DEER_FLOW_INTERNAL_AUTH_TOKEN=$(gen_hex)
           ENVEOF
+            echo "[env] generated $ROOT/.env"
           fi
-          # shellcheck disable=SC1091
-          set -a; . "$ROOT/.env"; set +a
-          export DEER_FLOW_PROJECT_ROOT="$DF"
-          export DEER_FLOW_HOME="$DF/backend/.deer-flow"
-          export DEER_FLOW_CONFIG_PATH="$DF/config.yaml"
-          export DEER_FLOW_EXTENSIONS_CONFIG_PATH="$DF/extensions_config.json"
-          export DEER_FLOW_STREAM_BRIDGE_REDIS_URL=redis://127.0.0.1:6379/0
-          export DEER_FLOW_CHANNELS_LANGGRAPH_URL=http://127.0.0.1:8001/api
-          export DEER_FLOW_CHANNELS_GATEWAY_URL=http://127.0.0.1:8001
-          export AUTH_TRUSTED_PROXIES=127.0.0.1
-          export DEER_FLOW_HOST_BASE_DIR="$DF"
 
-          echo "[1/4] redis..."
-          docker start deer-flow-redis 2>/dev/null || \
-            docker run -d --name deer-flow-redis --network host --restart unless-stopped redis:7-alpine
+          mkdir -p "$ROOT/redis-data" "$DF/backend/.deer-flow" "$DF/logs"
 
-          echo "[2/4] nginx..."
-          docker start deer-flow-nginx 2>/dev/null || \
-            docker run -d --name deer-flow-nginx --network host --restart unless-stopped \
-              -v "$DF/docker/nginx/nginx-host.conf:/etc/nginx/nginx.conf:ro" nginx:1.31.2-alpine
+          docker compose -f "$DF/docker/docker-compose.offline.yaml" up -d
 
-          echo "[3/4] gateway..."
-          cd "$DF/backend"
-          nohup env PYTHONPATH=. "$DF/backend/.venv/bin/python" -m uvicorn app.gateway.app:app \
-            --host 127.0.0.1 --port 8001 > "$LOGS/gateway.log" 2>&1 &
-          echo $! > "$LOGS/gateway.pid"
-
-          echo "[4/4] frontend..."
-          cd "$DF/frontend"
-          nohup env PORT=3000 "$ROOT/node/bin/node" node_modules/next/dist/bin/next start -H 127.0.0.1 -p 3000 > "$LOGS/frontend.log" 2>&1 &
-          echo $! > "$LOGS/frontend.pid"
-
-          sleep 8
           echo ""
-          echo "gateway  pid $(cat "$LOGS/gateway.pid")  -> http://127.0.0.1:8001/health"
-          echo "frontend pid $(cat "$LOGS/frontend.pid") -> http://127.0.0.1:3000"
-          echo "entry: http://<server-ip>:2026   logs: $LOGS/{gateway,frontend}.log"
-          SCRIPT
+          echo "started."
+          echo "  entry:      http://<server-ip>:2026"
+          echo "  first boot: backend installs Python env; frontend installs deps + builds"
+          echo "  progress:   docker logs -f deerflow-backend"
+          echo "              docker logs -f deerflow-frontend"
+          SH
 
-          cat > "$DEERFLOW_ROOT/deer-flow/stop-offline.sh" <<'SCRIPT'
+          cat > scripts-offline/stop-offline.sh <<'SH'
           #!/usr/bin/env bash
-          LOGS=/opt/deerflow/deer-flow/logs
-          for f in gateway frontend; do
-            if [ -f "$LOGS/$f.pid" ]; then
-              kill "$(cat "$LOGS/$f.pid")" 2>/dev/null || true
-              rm -f "$LOGS/$f.pid"
-            fi
-          done
-          docker stop deer-flow-nginx deer-flow-redis 2>/dev/null || true
+          set -euo pipefail
+          docker compose -f /opt/deerflow/deer-flow/docker/docker-compose.offline.yaml down
           echo "stopped."
-          SCRIPT
+          SH
 
-          chmod +x "$DEERFLOW_ROOT/deer-flow/start-offline.sh" "$DEERFLOW_ROOT/deer-flow/stop-offline.sh"
-          bash -n "$DEERFLOW_ROOT/deer-flow/start-offline.sh"
-          bash -n "$DEERFLOW_ROOT/deer-flow/stop-offline.sh"
+          cat > scripts-offline/build-frontend.sh <<'SH'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          docker exec deerflow-frontend bash -c "cd /opt/deerflow/deer-flow/frontend && SKIP_ENV_VALIDATION=1 pnpm build"
+          docker restart deerflow-frontend
+          echo "[done] frontend rebuilt and restarted"
+          SH
 
-      - name: Pull infrastructure images
+          cat > DEPLOY.md <<'MD'
+          # DeerFlow Offline Deploy Runbook
+
+          Add `sudo` before docker commands if permission denied.
+
+          ## One-time setup
+          1. Load images:
+                  cat deerflow-images.part.* | docker load
+          2. Unpack runtime:
+                  sudo mkdir -p /opt/deerflow
+                  sudo chown "$(id -un):$(id -gn)" /opt/deerflow
+                  mkdir -p /opt/deerflow/deer-flow
+                  tar -xzf deerflow-runtime.tar.gz -C /opt/deerflow/deer-flow
+          3. Start:
+                  cd /opt/deerflow/deer-flow
+                  ./scripts-offline/start-offline.sh
+             First boot takes 10-30 min (backend installs Python env; frontend
+             installs deps and builds). Watch progress:
+                  docker logs -f deerflow-backend
+                  docker logs -f deerflow-frontend
+          4. Configure models (required): edit /opt/deerflow/deer-flow/config.yaml
+             models section -> point at an LLM endpoint reachable from this server,
+             then: docker restart deerflow-backend
+          5. Open http://<server-ip>:2026
+
+          ## Daily iteration
+          - Backend code change: replace files under backend/, then:
+                docker restart deerflow-backend
+          - Frontend code change: replace files under frontend/, then:
+                ./scripts-offline/build-frontend.sh
+          - Add python package (into backend venv):
+                docker exec -it deerflow-backend bash -c "cd backend && uv pip install <package>"
+          - Add npm package:
+                docker exec -it deerflow-frontend pnpm add <package>
+          - Reset python env: rm -rf backend/.venv && docker restart deerflow-backend
+          - Reset frontend deps: rm -rf frontend/node_modules && docker restart deerflow-frontend
+
+          ## Lifecycle
+          - Stop:  ./scripts-offline/stop-offline.sh
+          - Start: ./scripts-offline/start-offline.sh
+          MD
+
+          chmod +x scripts-offline/*.sh
+          bash -n scripts-offline/backend-run.sh
+          bash -n scripts-offline/frontend-run.sh
+          bash -n scripts-offline/start-offline.sh
+          bash -n scripts-offline/stop-offline.sh
+          bash -n scripts-offline/build-frontend.sh
+          sudo mkdir -p /opt/deerflow && sudo touch /opt/deerflow/.env
+          docker compose -f docker/docker-compose.offline.yaml config --quiet && echo "compose file valid"
+
+      - name: Pack runtime artifact (source + offline scripts)
         run: |
+          tar -czf /tmp/deerflow-runtime.tar.gz --exclude=.git -C "$GITHUB_WORKSPACE" .
+          ls -lh /tmp/deerflow-runtime.tar.gz
+
+      - name: Pull images
+        run: |
+          docker pull python:3.12-bookworm
+          docker pull node:22-bookworm
           docker pull redis:7-alpine
           docker pull nginx:1.31.2-alpine
           docker pull enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0
 
-      - name: Pack artifacts (split parts)
+      - name: Pack images artifact (split parts)
         run: |
-          mkdir -p out-images out-runtime
-          docker save \
-            redis:7-alpine \
-            nginx:1.31.2-alpine \
+          mkdir -p out-images
+          docker save python:3.12-bookworm node:22-bookworm redis:7-alpine nginx:1.31.2-alpine \
             enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox:1.11.0 \
             | split -b 1900m - out-images/deerflow-images.part.
-          tar -czf - -C /opt deerflow | split -b 1900m - out-runtime/deerflow-runtime.part.
-          ls -lh out-images out-runtime
+          ls -lh out-images/
 
       - name: Upload images artifact
         uses: actions/upload-artifact@v4
@@ -178,6 +278,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: deerflow-runtime
-          path: out-runtime/
+          path: /tmp/deerflow-runtime.tar.gz
           if-no-files-found: error
           retention-days: 7
